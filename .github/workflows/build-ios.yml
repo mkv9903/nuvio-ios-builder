@@ -33,7 +33,7 @@ jobs:
       NUVIO_KOTLIN_NATIVE_JVMARGS: -Xmx4608M
 
     steps:
-      # 1. Check out NuvioMobile (WITHOUT recursive submodules to prevent libass-android error)
+      # 1. Check out NuvioMobile
       - name: Checkout NuvioMobile Repository
         uses: actions/checkout@v4
         with:
@@ -41,12 +41,22 @@ jobs:
           ref: ${{ inputs.branch }}
           fetch-depth: 1
 
-      # 2. Extract exact version and build number from Nuvio configuration
+      # 2. Select Xcode 16 (Required for Project Format 77)
+      - name: Select Xcode 16
+        run: |
+          XCODE_16=$(find /Applications -maxdepth 1 -name "Xcode_16*.app" | sort -V | tail -n 1)
+          if [ -n "$XCODE_16" ]; then
+            echo "Switching to $XCODE_16"
+            sudo xcode-select -s "$XCODE_16/Contents/Developer"
+            echo "DEVELOPER_DIR=$XCODE_16/Contents/Developer" >> "$GITHUB_ENV"
+          fi
+          xcodebuild -version
+
+      # 3. Extract exact version and build number
       - name: Extract App Version & Metadata
         id: meta
         run: |
           VERSION_FILE="iosApp/Configuration/Version.xcconfig"
-          
           APP_VERSION=$(sed -nE 's/^[[:space:]]*MARKETING_VERSION[[:space:]]*=[[:space:]]*(.+)/\1/p' "$VERSION_FILE" | tr -d '\r' | head -n 1)
           BUILD_NUMBER=$(sed -nE 's/^[[:space:]]*CURRENT_PROJECT_VERSION[[:space:]]*=[[:space:]]*(.+)/\1/p' "$VERSION_FILE" | tr -d '\r' | head -n 1)
           SHORT_SHA=$(git rev-parse --short HEAD)
@@ -54,20 +64,22 @@ jobs:
           echo "version=${APP_VERSION}" >> "$GITHUB_OUTPUT"
           echo "build_number=${BUILD_NUMBER}" >> "$GITHUB_OUTPUT"
           echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
-          
           echo "Building Nuvio version ${APP_VERSION} (Build ${BUILD_NUMBER}) [${SHORT_SHA}]"
 
-      # 3. Setup Java & Gradle
+      # 4. Setup Java 17
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Gradle
+      # 5. Gradle Cache
+      - name: Set up Gradle & Cache
         uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
 
-      # 4. Cache Kotlin Native toolchain for speed
+      # 6. Cache Kotlin/Native Toolchain
       - name: Cache Kotlin Native Toolchain
         uses: actions/cache@v4
         with:
@@ -76,19 +88,37 @@ jobs:
           restore-keys: |
             konan-${{ runner.os }}-${{ runner.arch }}-
 
-      # 5. Prepare iOS Dependencies (safely pulls MPVKit and NuvioEngine.xcframework)
+      # 7. Cache NuvioEngine Framework
+      - name: Cache NuvioEngine Framework
+        uses: actions/cache@v4
+        with:
+          path: ../nuvio-engine
+          key: nuvio-engine-${{ runner.os }}-${{ hashFiles('scripts/prepare-ios-dependencies.sh') }}
+          restore-keys: |
+            nuvio-engine-${{ runner.os }}-
+
+      # 8. Cache SwiftPM Dependencies
+      - name: Cache SwiftPM Dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/org.swift.swiftpm
+          key: swiftpm-${{ runner.os }}-${{ hashFiles('iosApp/iosApp.xcodeproj/project.pbxproj', 'MPVKit/Package.swift') }}
+          restore-keys: |
+            swiftpm-${{ runner.os }}-
+
+      # 9. Prepare iOS Dependencies
       - name: Prepare Scripts & Dependencies
         run: |
           chmod +x ./gradlew
           chmod +x ./scripts/*.sh
           ./scripts/prepare-ios-dependencies.sh
 
-      # 6. Build Unsigned IPA
+      # 10. Build Unsigned IPA
       - name: Build Unsigned IPA
         run: |
           ./scripts/build-ios-ipa.sh
 
-      # 7. Locate Generated IPA
+      # 11. Locate Generated IPA
       - name: Locate Generated IPA
         id: ipa_info
         run: |
@@ -104,7 +134,7 @@ jobs:
           echo "size=${IPA_SIZE}" >> "$GITHUB_OUTPUT"
           echo "Created IPA: ${IPA_NAME} (${IPA_SIZE})"
 
-      # 8. Upload Artifact as a fallback
+      # 12. Upload to GitHub Artifacts (Backup)
       - name: Upload to GitHub Artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -112,7 +142,7 @@ jobs:
           path: ${{ steps.ipa_info.outputs.path }}
           retention-days: 7
 
-      # 9. Create GitHub Release and attach the unsigned IPA
+      # 13. Publish to GitHub Releases
       - name: Publish to GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
