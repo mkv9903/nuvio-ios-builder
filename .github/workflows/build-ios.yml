@@ -33,34 +33,31 @@ jobs:
       NUVIO_KOTLIN_NATIVE_JVMARGS: -Xmx4608M
 
     steps:
+      # 1. Check out NuvioMobile (WITHOUT recursive submodules to prevent libass-android error)
       - name: Checkout NuvioMobile Repository
         uses: actions/checkout@v4
         with:
           repository: NuvioMedia/NuvioMobile
           ref: ${{ inputs.branch }}
-          submodules: recursive
           fetch-depth: 1
 
+      # 2. Extract exact version and build number from Nuvio configuration
       - name: Extract App Version & Metadata
         id: meta
         run: |
           VERSION_FILE="iosApp/Configuration/Version.xcconfig"
           
-          # Extract marketing version (e.g. 0.4.13)
           APP_VERSION=$(sed -nE 's/^[[:space:]]*MARKETING_VERSION[[:space:]]*=[[:space:]]*(.+)/\1/p' "$VERSION_FILE" | tr -d '\r' | head -n 1)
-          
-          # Extract build number (e.g. 117)
           BUILD_NUMBER=$(sed -nE 's/^[[:space:]]*CURRENT_PROJECT_VERSION[[:space:]]*=[[:space:]]*(.+)/\1/p' "$VERSION_FILE" | tr -d '\r' | head -n 1)
-          
-          # Get upstream commit short SHA
           SHORT_SHA=$(git rev-parse --short HEAD)
           
           echo "version=${APP_VERSION}" >> "$GITHUB_OUTPUT"
           echo "build_number=${BUILD_NUMBER}" >> "$GITHUB_OUTPUT"
           echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
           
-          echo "Extracted App Version: ${APP_VERSION} (Build: ${BUILD_NUMBER})"
+          echo "Building Nuvio version ${APP_VERSION} (Build ${BUILD_NUMBER}) [${SHORT_SHA}]"
 
+      # 3. Setup Java & Gradle
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
@@ -70,6 +67,7 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      # 4. Cache Kotlin Native toolchain for speed
       - name: Cache Kotlin Native Toolchain
         uses: actions/cache@v4
         with:
@@ -78,16 +76,19 @@ jobs:
           restore-keys: |
             konan-${{ runner.os }}-${{ runner.arch }}-
 
+      # 5. Prepare iOS Dependencies (safely pulls MPVKit and NuvioEngine.xcframework)
       - name: Prepare Scripts & Dependencies
         run: |
           chmod +x ./gradlew
           chmod +x ./scripts/*.sh
           ./scripts/prepare-ios-dependencies.sh
 
+      # 6. Build Unsigned IPA
       - name: Build Unsigned IPA
         run: |
           ./scripts/build-ios-ipa.sh
 
+      # 7. Locate Generated IPA
       - name: Locate Generated IPA
         id: ipa_info
         run: |
@@ -101,15 +102,17 @@ jobs:
           echo "path=${IPA_PATH}" >> "$GITHUB_OUTPUT"
           echo "filename=${IPA_NAME}" >> "$GITHUB_OUTPUT"
           echo "size=${IPA_SIZE}" >> "$GITHUB_OUTPUT"
-          echo "Found IPA: ${IPA_NAME} (${IPA_SIZE})"
+          echo "Created IPA: ${IPA_NAME} (${IPA_SIZE})"
 
-      - name: Upload to GitHub Artifacts (Backup)
+      # 8. Upload Artifact as a fallback
+      - name: Upload to GitHub Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.ipa_info.outputs.filename }}
           path: ${{ steps.ipa_info.outputs.path }}
           retention-days: 7
 
+      # 9. Create GitHub Release and attach the unsigned IPA
       - name: Publish to GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
@@ -122,13 +125,13 @@ jobs:
             - **Version:** `${{ steps.meta.outputs.version }}`
             - **Build Number:** `${{ steps.meta.outputs.build_number }}`
             - **Configuration:** `${{ inputs.configuration }}`
-            - **Upstream Source Commit:** `${{ steps.meta.outputs.short_sha }}`
-            - **Package Name:** `${{ steps.ipa_info.outputs.filename }}`
-            - **File Size:** `${{ steps.ipa_info.outputs.size }}`
+            - **Upstream Commit:** `${{ steps.meta.outputs.short_sha }}`
+            - **Filename:** `${{ steps.ipa_info.outputs.filename }}`
+            - **Size:** `${{ steps.ipa_info.outputs.size }}`
 
             ---
             ### 📲 How to Sideload:
-            1. Download the `.ipa` file below directly to your iPhone or PC.
+            1. Download the `.ipa` asset attached below.
             2. Sign and install using **SideStore**, **AltStore**, **Sideloadly**, or **TrollStore**.
           files: ${{ steps.ipa_info.outputs.path }}
           draft: false
