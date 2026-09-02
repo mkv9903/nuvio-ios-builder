@@ -113,7 +113,28 @@ jobs:
           chmod +x ./scripts/*.sh
           ./scripts/prepare-ios-dependencies.sh
 
-      # 10. Build Unsigned IPA
+      # 10. Patch Widget Extension Swift Compatibility (Fixes Xcode 16 Swift compilation)
+      - name: Patch Widget Extension Swift Compatibility
+        run: |
+          cat << 'EOF' > iosApp/DownloadsWidgetExtension/DownloadsWidgetBundle.swift
+          import WidgetKit
+          import SwiftUI
+
+          @main
+          struct DownloadsWidgetBundle: WidgetBundle {
+              @WidgetBundleBuilder
+              var body: some Widget {
+                  if #available(iOSApplicationExtension 16.1, *) {
+                      DownloadsLiveActivityWidget()
+                  }
+              }
+          }
+          EOF
+
+          # Ensure DownloadsLiveActivityAttributes has @available for ActivityKit
+          sed -i '' 's/^struct DownloadsLiveActivityAttributes: ActivityAttributes/@available(iOSApplicationExtension 16.1, *)\nstruct DownloadsLiveActivityAttributes: ActivityAttributes/' iosApp/DownloadsWidgetExtension/DownloadsLiveActivityWidget.swift
+
+      # 11. Build Unsigned IPA
       - name: Build Unsigned IPA
         run: |
           ./scripts/build-ios-ipa.sh
