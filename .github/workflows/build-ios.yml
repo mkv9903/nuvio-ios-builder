@@ -19,13 +19,18 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: ios-build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-and-release:
-    name: Build & Release iOS IPA
+    name: Build & Release Unsigned iOS IPA
     runs-on: macos-14
     timeout-minutes: 90
 
     env:
+      DEVELOPER_DIR: /Applications/Xcode_16.2.app/Contents/Developer
       GRADLE_OPTS: -Dfile.encoding=UTF-8
       IOS_CONFIGURATION: ${{ inputs.configuration }}
       KOTLIN_DAEMON_JVMARGS: -Xmx2048M
@@ -33,26 +38,18 @@ jobs:
       NUVIO_KOTLIN_NATIVE_JVMARGS: -Xmx4608M
 
     steps:
-      # 1. Check out NuvioMobile
-      - name: Checkout NuvioMobile Repository
+      - name: Check out source
         uses: actions/checkout@v4
         with:
           repository: NuvioMedia/NuvioMobile
           ref: ${{ inputs.branch }}
           fetch-depth: 1
 
-      # 2. Select Xcode 16 (Required for Project Format 77)
-      - name: Select Xcode 16
+      - name: Verify Apple toolchain
         run: |
-          XCODE_16=$(find /Applications -maxdepth 1 -name "Xcode_16*.app" | sort -V | tail -n 1)
-          if [ -n "$XCODE_16" ]; then
-            echo "Switching to $XCODE_16"
-            sudo xcode-select -s "$XCODE_16/Contents/Developer"
-            echo "DEVELOPER_DIR=$XCODE_16/Contents/Developer" >> "$GITHUB_ENV"
-          fi
           xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
 
-      # 3. Extract exact version and build number
       - name: Extract App Version & Metadata
         id: meta
         run: |
@@ -66,21 +63,18 @@ jobs:
           echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
           echo "Building Nuvio version ${APP_VERSION} (Build ${BUILD_NUMBER}) [${SHORT_SHA}]"
 
-      # 4. Setup Java 17
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      # 5. Gradle Cache
-      - name: Set up Gradle & Cache
+      - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           cache-read-only: false
 
-      # 6. Cache Kotlin/Native Toolchain
-      - name: Cache Kotlin Native Toolchain
+      - name: Cache Kotlin Native
         uses: actions/cache@v4
         with:
           path: ~/.konan
@@ -88,285 +82,51 @@ jobs:
           restore-keys: |
             konan-${{ runner.os }}-${{ runner.arch }}-
 
-      # 7. Cache NuvioEngine Framework
-      - name: Cache NuvioEngine Framework
-        uses: actions/cache@v4
-        with:
-          path: ../nuvio-engine
-          key: nuvio-engine-${{ runner.os }}-${{ hashFiles('scripts/prepare-ios-dependencies.sh') }}
-          restore-keys: |
-            nuvio-engine-${{ runner.os }}-
-
-      # 8. Cache SwiftPM Dependencies
-      - name: Cache SwiftPM Dependencies
-        uses: actions/cache@v4
-        with:
-          path: ~/Library/Caches/org.swift.swiftpm
-          key: swiftpm-${{ runner.os }}-${{ hashFiles('iosApp/iosApp.xcodeproj/project.pbxproj', 'MPVKit/Package.swift') }}
-          restore-keys: |
-            swiftpm-${{ runner.os }}-
-
-      # 9. Prepare iOS Dependencies
-      - name: Prepare Scripts & Dependencies
+      - name: Prepare iOS dependencies
         run: |
           chmod +x ./gradlew
           chmod +x ./scripts/*.sh
           ./scripts/prepare-ios-dependencies.sh
 
-      # 10. Patch Widget Extension Swift Compatibility (Fixes trailing comma syntax errors & iOS 16.1 availability)
-      - name: Patch Widget Extension Swift Compatibility
+      - name: Build unsigned full ${{ inputs.configuration }} IPA
         run: |
-          cat << 'EOF' > iosApp/DownloadsWidgetExtension/DownloadsWidgetBundle.swift
-          import WidgetKit
-          import SwiftUI
-
-          @main
-          struct DownloadsWidgetBundle: WidgetBundle {
-              @WidgetBundleBuilder
-              var body: some Widget {
-                  if #available(iOSApplicationExtension 16.1, *) {
-                      DownloadsLiveActivityWidget()
-                  }
-              }
-          }
-          EOF
-
-          cat << 'EOF' > iosApp/DownloadsWidgetExtension/DownloadsLiveActivityWidget.swift
-          import ActivityKit
-          import SwiftUI
-          import WidgetKit
-
-          @available(iOSApplicationExtension 16.1, *)
-          struct DownloadsLiveActivityAttributes: ActivityAttributes {
-              public struct ContentState: Codable, Hashable, Sendable {
-                  let status: String
-                  let progressPercent: Int
-                  let transferredText: String
-              }
-
-              let downloadId: String
-              let title: String
-              let subtitle: String
-          }
-
-          @available(iOSApplicationExtension 16.1, *)
-          struct DownloadsLiveActivityWidget: Widget {
-              private let downloadsUrl = URL(string: "nuvio://downloads")
-              private let appBlue = Color(red: 30.0 / 255.0, green: 136.0 / 255.0, blue: 229.0 / 255.0)
-
-              var body: some WidgetConfiguration {
-                  ActivityConfiguration(for: DownloadsLiveActivityAttributes.self) { context in
-                      DownloadActivityLockScreenView(context: context)
-                          .widgetURL(downloadsUrl)
-                  } dynamicIsland: { context in
-                      DynamicIsland {
-                          DynamicIslandExpandedRegion(.leading) {
-                              Text(statusLabel(context.state.status))
-                                  .font(.caption.weight(.semibold))
-                                  .foregroundStyle(.white.opacity(0.88))
-                                  .lineLimit(1)
-                          }
-                          DynamicIslandExpandedRegion(.trailing) {
-                              Text(progressLabel(context.state.progressPercent))
-                                  .font(.title3.monospacedDigit().weight(.semibold))
-                                  .foregroundStyle(.white)
-                          }
-                          DynamicIslandExpandedRegion(.bottom) {
-                              VStack(alignment: .leading, spacing: 8) {
-                                  Text(context.attributes.title)
-                                      .font(.subheadline.weight(.semibold))
-                                      .lineLimit(1)
-                                      .minimumScaleFactor(0.86)
-                                      .truncationMode(.tail)
-                                  Text(context.attributes.subtitle)
-                                      .font(.caption)
-                                      .foregroundStyle(.white.opacity(0.82))
-                                      .lineLimit(1)
-                                      .minimumScaleFactor(0.9)
-                                      .truncationMode(.tail)
-                                  ProgressView(value: normalizedProgress(context.state.progressPercent))
-                                      .progressViewStyle(.linear)
-                                      .tint(appBlue)
-                                  HStack {
-                                      Text(context.state.transferredText)
-                                          .font(.caption.monospacedDigit())
-                                          .foregroundStyle(.white.opacity(0.86))
-                                      Spacer(minLength: 6)
-                                      Label(statusLabel(context.state.status), systemImage: "arrow.down")
-                                          .font(.caption)
-                                          .foregroundStyle(.white.opacity(0.86))
-                                  }
-                              }
-                              .padding(.top, 4)
-                              .padding(.horizontal, 10)
-                          }
-                      } compactLeading: {
-                          AccentGlyphView()
-                      } compactTrailing: {
-                          Text(progressLabel(context.state.progressPercent))
-                              .font(.caption2.monospacedDigit())
-                              .foregroundStyle(appBlue)
-                      } minimal: {
-                          AccentGlyphView()
-                      }
-                      .widgetURL(downloadsUrl)
-                      .keylineTint(appBlue)
-                  }
-              }
-
-              private func progressLabel(_ progressPercent: Int) -> String {
-                  if progressPercent < 0 { return "--%" }
-                  return "\(max(0, min(100, progressPercent)))%"
-              }
-
-              private func normalizedProgress(_ progressPercent: Int) -> Double {
-                  guard progressPercent >= 0 else { return 0 }
-                  return min(max(Double(progressPercent) / 100.0, 0), 1)
-              }
-
-              private func statusLabel(_ status: String) -> String {
-                  switch status.lowercased() {
-                  case "downloading": return "Downloading"
-                  case "paused": return "Paused"
-                  case "failed": return "Failed"
-                  default: return "Active"
-                  }
-              }
-          }
-
-          @available(iOSApplicationExtension 16.1, *)
-          private struct DownloadActivityLockScreenView: View {
-              let context: ActivityViewContext<DownloadsLiveActivityAttributes>
-
-              var body: some View {
-                  ZStack {
-                      LinearGradient(
-                          colors: backgroundGradientColors,
-                          startPoint: .topLeading,
-                          endPoint: .bottomTrailing
-                      )
-
-                      VStack(alignment: .leading, spacing: 12) {
-                          HStack(alignment: .top, spacing: 10) {
-                              VStack(alignment: .leading, spacing: 6) {
-                                  Text(context.attributes.title)
-                                      .font(.headline.weight(.semibold))
-                                      .lineLimit(2)
-                                      .fixedSize(horizontal: false, vertical: true)
-                                  Text(context.attributes.subtitle)
-                                      .font(.subheadline)
-                                      .foregroundStyle(.white.opacity(0.82))
-                                      .lineLimit(2)
-                                      .fixedSize(horizontal: false, vertical: true)
-                              }
-                              Spacer(minLength: 10)
-                              Text(progressLabel(context.state.progressPercent))
-                                  .font(.title3.monospacedDigit().weight(.semibold))
-                                  .foregroundStyle(.white)
-                                  .padding(.top, 1)
-                          }
-
-                          ProgressView(value: normalizedProgress(context.state.progressPercent))
-                              .progressViewStyle(.linear)
-                              .tint(.white)
-
-                          HStack {
-                              Label(statusLabel(context.state.status), systemImage: "arrow.down")
-                                  .font(.caption)
-                                  .foregroundStyle(.white.opacity(0.86))
-                              Spacer()
-                              Text(context.state.transferredText)
-                                  .font(.caption.monospacedDigit())
-                                  .foregroundStyle(.white.opacity(0.86))
-                          }
-                      }
-                      .padding(.horizontal, 16)
-                      .padding(.vertical, 16)
-                      .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                  }
-                  .frame(maxWidth: .infinity, minHeight: 168, maxHeight: .infinity, alignment: .top)
-                  .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                  .overlay(
-                      RoundedRectangle(cornerRadius: 14, style: .continuous)
-                          .stroke(Color.white.opacity(0.10), lineWidth: 1)
-                  )
-                  .activityBackgroundTint(.clear)
-                  .activitySystemActionForegroundColor(.white)
-              }
-
-              private func progressLabel(_ progressPercent: Int) -> String {
-                  if progressPercent < 0 { return "--%" }
-                  return "\(max(0, min(100, progressPercent)))%"
-              }
-
-              private func normalizedProgress(_ progressPercent: Int) -> Double {
-                  guard progressPercent >= 0 else { return 0 }
-                  return min(max(Double(progressPercent) / 100.0, 0), 1)
-              }
-
-              private func statusLabel(_ status: String) -> String {
-                  switch status.lowercased() {
-                  case "downloading": return "Downloading"
-                  case "paused": return "Paused"
-                  case "failed": return "Failed"
-                  default: return "Active"
-                  }
-              }
-
-              private var backgroundGradientColors: [Color] {
-                  let accent = Color(red: 30.0 / 255.0, green: 136.0 / 255.0, blue: 229.0 / 255.0)
-                  return [
-                      accent.opacity(0.92),
-                      accent.opacity(0.42),
-                      Color.black.opacity(0.97)
-                  ]
-              }
-          }
-
-          private struct AccentGlyphView: View {
-              var body: some View {
-                  ZStack {
-                      RoundedRectangle(cornerRadius: 6, style: .continuous)
-                          .fill(Color(red: 30.0 / 255.0, green: 136.0 / 255.0, blue: 229.0 / 255.0).opacity(0.88))
-                      Image(systemName: "arrow.down")
-                          .font(.caption2.bold())
-                          .foregroundStyle(.white)
-                  }
-                  .frame(width: 22, height: 22)
-              }
-          }
-          EOF
-
-      # 11. Build Unsigned IPA
-      - name: Build Unsigned IPA
-        run: |
+          (
+            while sleep 60; do
+              echo "::group::Build resources $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+              uptime
+              vm_stat
+              ps -Ao pid,etime,%cpu,rss,command -r | head -n 12 || true
+              echo "::endgroup::"
+            done
+          ) &
+          monitor_pid=$!
+          trap 'kill "${monitor_pid}" 2>/dev/null || true' EXIT
           ./scripts/build-ios-ipa.sh
 
-      # 11. Locate Generated IPA
       - name: Locate Generated IPA
         id: ipa_info
         run: |
-          IPA_PATH=$(find build/ios-ipa -type f -name "*.ipa" | head -n 1)
-          if [ -z "$IPA_PATH" ]; then
+          configuration_slug="$(printf '%s' "${IOS_CONFIGURATION}" | tr '[:upper:]' '[:lower:]')"
+          ipa_path="$(find build/ios-ipa -maxdepth 1 -type f -name "*-full-${configuration_slug}.ipa" -print -quit)"
+          if [[ -z "${ipa_path}" ]]; then
             echo "::error::No IPA file found in build/ios-ipa/"
             exit 1
           fi
-          IPA_NAME=$(basename "$IPA_PATH")
-          IPA_SIZE=$(du -h "$IPA_PATH" | cut -f1)
-          echo "path=${IPA_PATH}" >> "$GITHUB_OUTPUT"
-          echo "filename=${IPA_NAME}" >> "$GITHUB_OUTPUT"
-          echo "size=${IPA_SIZE}" >> "$GITHUB_OUTPUT"
-          echo "Created IPA: ${IPA_NAME} (${IPA_SIZE})"
+          ipa_name="$(basename "${ipa_path}")"
+          ipa_size="$(du -h "${ipa_path}" | cut -f1)"
+          
+          echo "path=${ipa_path}" >> "$GITHUB_OUTPUT"
+          echo "filename=${ipa_name}" >> "$GITHUB_OUTPUT"
+          echo "size=${ipa_size}" >> "$GITHUB_OUTPUT"
+          echo "Created IPA: ${ipa_name} (${ipa_size})"
 
-      # 12. Upload to GitHub Artifacts (Backup)
-      - name: Upload to GitHub Artifacts
+      - name: Upload Artifact (Backup)
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.ipa_info.outputs.filename }}
           path: ${{ steps.ipa_info.outputs.path }}
           retention-days: 7
 
-      # 13. Publish to GitHub Releases
       - name: Publish to GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
